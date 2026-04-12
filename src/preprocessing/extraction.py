@@ -3,9 +3,9 @@ import re
 import json
 from typing import List, Dict
 import sys
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
-from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
+# from docling.datamodel.pipeline_options import PdfPipelineOptions
+# from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
+# from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
 
 def extract_sections_from_markdown(
     file_path: str,
@@ -168,6 +168,9 @@ def extract_index_with_range_expansion(text_content):
     return json.dumps(index_data, indent=2)
 
 def convert_and_save_with_page_numbers(input_file_path, output_file_path):
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption, InputFormat
+    from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
     """
     Converts a document to Markdown, iterating page by page
     to insert a custom footer with the page number after each page,

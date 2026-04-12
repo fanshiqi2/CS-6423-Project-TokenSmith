@@ -1,6 +1,8 @@
 # noinspection PyUnresolvedReferences
 import faiss  # force single OpenMP init
 
+import time
+
 import argparse
 import json
 import pathlib
@@ -65,8 +67,10 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
         print("ERROR: No markdown files found in data/.", file=sys.stderr)
         sys.exit(1)
 
+    start_time = time.perf_counter()
+
     build_index(
-        markdown_file=str(md_files[0]),
+        markdown_files=[str(f) for f in md_files],
         chunker=chunker,
         chunk_config=cfg.chunk_config,
         embedding_model_path=cfg.embed_model,
@@ -75,6 +79,9 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
         use_multiprocessing=args.multiproc_indexing,
         use_headings=args.embed_with_headings,
     )
+
+    elapsed = time.perf_counter() - start_time
+    print(f"\nTotal indexing time: {elapsed:.2f} seconds ({elapsed / 60:.2f} minutes)")
 
 def use_indexed_chunks(question: str, chunks: list) -> list:
     # Logic for keyword matching from textbook index

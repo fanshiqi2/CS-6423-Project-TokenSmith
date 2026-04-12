@@ -14,6 +14,8 @@ import re
 import json
 from typing import List, Dict
 
+import time
+
 import faiss
 from rank_bm25 import BM25Okapi
 from src.embedder import SentenceTransformer
@@ -35,7 +37,7 @@ DEFAULT_EXCLUSION_KEYWORDS = ['questions', 'exercises', 'summary', 'references']
 # ------------------------ Main index builder -----------------------------
 
 def build_index(
-    markdown_file: str,
+    markdown_files: List[str],
     *,
     chunker: DocumentChunker,
     chunk_config: ChunkConfig,
@@ -55,15 +57,19 @@ def build_index(
         - {prefix}_sources.pkl
         - {prefix}_meta.pkl
     """
+    start_time = time.perf_counter()
+
     all_chunks: List[str] = []
     sources: List[str] = []
     metadata: List[Dict] = []
 
     # Extract sections from markdown. Exclude some with certain keywords.
-    sections = extract_sections_from_markdown(
-        markdown_file,
-        exclusion_keywords=DEFAULT_EXCLUSION_KEYWORDS
-    )
+    sections = []
+    for markdown_file in markdown_files:
+        sections.extend(extract_sections_from_markdown(
+            markdown_file,
+            exclusion_keywords=DEFAULT_EXCLUSION_KEYWORDS
+        ))
 
     page_to_chunk_ids = {}
     current_page = 1
@@ -225,6 +231,10 @@ def build_index(
     with open(artifacts_dir / f"{index_prefix}_meta.pkl", "wb") as f:
         pickle.dump(metadata, f)
     print(f"Saved all index artifacts with prefix: {index_prefix}")
+
+    # Step 6: Print total time taken
+    elapsed = time.perf_counter() - start_time
+    print(f"Total indexing time: {elapsed:.2f} seconds")
 
 # ------------------------ Helper functions ------------------------------
 
