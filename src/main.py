@@ -15,7 +15,8 @@ from rich.markdown import Markdown
 
 from src.config import RAGConfig
 from src.generator import answer, double_answer, dedupe_generated_text
-from src.index_builder import build_index
+from src.index_builder import build_index, update_index_add_only
+from src.index_manifest import build_doc_record, compute_sha256, save_manifest, load_manifest
 from src.instrumentation.logging import get_logger
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
@@ -52,6 +53,16 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+def detect_added_files(md_files: List[pathlib.Path], manifest: Dict[str, Any]) -> List[pathlib.Path]:
+    existing_docs = manifest.get("documents", {})
+    added_files = []
+
+    for md_file in md_files:
+        if md_file.name not in existing_docs:
+            added_files.append(md_file)
+
+    return added_files
+
 def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
     strategy = cfg.get_chunk_strategy()
     chunker = DocumentChunker(strategy=strategy, keep_tables=args.keep_tables)
@@ -69,16 +80,76 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
 
     start_time = time.perf_counter()
 
-    build_index(
-        markdown_files=[str(f) for f in md_files],
-        chunker=chunker,
-        chunk_config=cfg.chunk_config,
-        embedding_model_path=cfg.embed_model,
-        artifacts_dir=artifacts_dir,
-        index_prefix=args.index_prefix,
-        use_multiprocessing=args.multiproc_indexing,
-        use_headings=args.embed_with_headings,
-    )
+    manifest = load_manifest(artifacts_dir, args.index_prefix)
+
+    # Case 1: first run, no existing manifest
+    if not manifest["documents"]:
+        print("No manifest found or manifest is empty. Running initial full indexing...")
+
+        doc_ranges = build_index(
+            markdown_files=[str(f) for f in md_files],
+            chunker=chunker,
+            chunk_config=cfg.chunk_config,
+            embedding_model_path=cfg.embed_model,
+            artifacts_dir=artifacts_dir,
+            index_prefix=args.index_prefix,
+            use_multiprocessing=args.multiproc_indexing,
+            use_headings=args.embed_with_headings,
+        )
+
+        new_manifest = {
+            "version": 1,
+            "index_prefix": args.index_prefix,
+            "documents": {}
+        }
+
+        for doc in doc_ranges:
+            path = pathlib.Path(doc["path"])
+            sha256 = compute_sha256(path)
+            new_manifest["documents"][path.name] = build_doc_record(
+                path=path,
+                sha256=sha256,
+                chunk_start=doc["chunk_start"],
+                chunk_end=doc["chunk_end"],
+            )
+
+        save_manifest(new_manifest, artifacts_dir, args.index_prefix)
+
+    # Case 2: manifest exists, detect newly added files only
+    else:
+        added_files = detect_added_files(md_files, manifest)
+
+        if not added_files:
+            print("No new markdown files detected. Nothing to update.")
+            elapsed = time.perf_counter() - start_time
+            print(f"\nTotal indexing time: {elapsed:.2f} seconds ({elapsed / 60:.2f} minutes)")
+            return
+
+        print(f"Detected {len(added_files)} new file(s): {[f.name for f in added_files]}")
+        print("Running incremental add-only update...")
+
+        doc_ranges = update_index_add_only(
+            markdown_files=[str(f) for f in added_files],
+            chunker=chunker,
+            chunk_config=cfg.chunk_config,
+            embedding_model_path=cfg.embed_model,
+            artifacts_dir=artifacts_dir,
+            index_prefix=args.index_prefix,
+            use_multiprocessing=args.multiproc_indexing,
+            use_headings=args.embed_with_headings,
+        )
+
+        for doc in doc_ranges:
+            path = pathlib.Path(doc["path"])
+            sha256 = compute_sha256(path)
+            manifest["documents"][path.name] = build_doc_record(
+                path=path,
+                sha256=sha256,
+                chunk_start=doc["chunk_start"],
+                chunk_end=doc["chunk_end"],
+            )
+
+        save_manifest(manifest, artifacts_dir, args.index_prefix)
 
     elapsed = time.perf_counter() - start_time
     print(f"\nTotal indexing time: {elapsed:.2f} seconds ({elapsed / 60:.2f} minutes)")

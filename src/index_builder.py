@@ -46,7 +46,7 @@ def build_index(
     index_prefix: str,
     use_multiprocessing: bool = False,
     use_headings: bool = False
-) -> None:
+) -> List[Dict]:
     """
     Extract sections, chunk, embed, and build both FAISS and BM25 indexes.
 
@@ -56,121 +56,110 @@ def build_index(
         - {prefix}_chunks.pkl
         - {prefix}_sources.pkl
         - {prefix}_meta.pkl
+
+    Returns:
+        A list of per-document chunk ranges, for example:
+        [
+            {"path": "data/file1.md", "chunk_start": 0, "chunk_end": 139},
+            {"path": "data/file2.md", "chunk_start": 140, "chunk_end": 317},
+        ]
     """
     start_time = time.perf_counter()
 
     all_chunks: List[str] = []
     sources: List[str] = []
     metadata: List[Dict] = []
-
-    # Extract sections from markdown. Exclude some with certain keywords.
-    sections = []
-    for markdown_file in markdown_files:
-        sections.extend(extract_sections_from_markdown(
-            markdown_file,
-            exclusion_keywords=DEFAULT_EXCLUSION_KEYWORDS
-        ))
+    doc_ranges: List[Dict] = []
 
     page_to_chunk_ids = {}
     current_page = 1
-    total_chunks = 0
-    heading_stack = []
 
-    # Step 1: Chunk using DocumentChunker
-    for i, c in enumerate(sections):
-        # Determine current section level
-        current_level = c.get('level', 1)
+    # Process each markdown file separately so source tracking is correct
+    for markdown_file in markdown_files:
+        sections = extract_sections_from_markdown(
+            markdown_file,
+            exclusion_keywords=DEFAULT_EXCLUSION_KEYWORDS
+        )
 
-        # Determine current chapter number
-        chapter_num = c.get('chapter', 0)
+        heading_stack = []
+        doc_chunk_start = len(all_chunks)
 
-        # Pop sections that are deeper or siblings
-        while heading_stack and heading_stack[-1][0] >= current_level:
-            heading_stack.pop()
-        
-        # Push pair of (level, heading)
-        if c['heading'] != "Introduction":
-            heading_stack.append((current_level, c['heading']))
+        for c in sections:
+            current_level = c.get("level", 1)
+            chapter_num = c.get("chapter", 0)
 
-        # Construct section path
-        path_list = [h[1] for h in heading_stack]
-        full_section_path = " ".join(path_list)
-        full_section_path = f"Chapter {chapter_num} " + full_section_path
+            while heading_stack and heading_stack[-1][0] >= current_level:
+                heading_stack.pop()
 
-        # Use DocumentChunker to recursively split this section
-        sub_chunks = chunker.chunk(c['content'])
+            if c["heading"] != "Introduction":
+                heading_stack.append((current_level, c["heading"]))
 
-        # Regex to find page markers like "--- Page 3 ---"
-        page_pattern = re.compile(r'--- Page (\d+) ---')
+            path_list = [h[1] for h in heading_stack]
+            full_section_path = " ".join(path_list)
+            full_section_path = f"Chapter {chapter_num} " + full_section_path
 
-        # Iterate through each chunk produced from this section
-        for sub_chunk_id, sub_chunk in enumerate(sub_chunks):
-            # Track all pages this specific chunk touches
-            chunk_pages = set()
+            sub_chunks = chunker.chunk(c["content"])
 
-            # Split the sub_chunk by page markers to see if it
-            # spans multiple pages.
-            fragments = page_pattern.split(sub_chunk)
+            page_pattern = re.compile(r"--- Page (\d+) ---")
 
-            # If there is content before the first page marker,
-            # it belongs to the current_page.
-            if fragments[0].strip():
-                page_to_chunk_ids.setdefault(current_page, set()).add(total_chunks+sub_chunk_id)
-                chunk_pages.add(current_page)
+            for sub_chunk in sub_chunks:
+                global_chunk_id = len(all_chunks)
+                chunk_pages = set()
 
-            # Process the new pages found within this sub_chunk. 
-            # Step by 2 where each pair represents (page number, text after it)
-            for i in range(1, len(fragments), 2):
-                try:
-                    # Get the new page number from the marker
-                    new_page = int(fragments[i]) + 1
+                fragments = page_pattern.split(sub_chunk)
 
-                    # If there is text after this marker, it belongs to the new_page.
-                    if fragments[i+1].strip():
-                        page_to_chunk_ids.setdefault(new_page, set()).add(total_chunks + sub_chunk_id)
-                        chunk_pages.add(new_page)
-                    
-                    current_page = new_page
+                if fragments[0].strip():
+                    page_to_chunk_ids.setdefault(current_page, set()).add(global_chunk_id)
+                    chunk_pages.add(current_page)
 
-                except (IndexError, ValueError):
+                for i in range(1, len(fragments), 2):
+                    try:
+                        new_page = int(fragments[i]) + 1
+
+                        if fragments[i + 1].strip():
+                            page_to_chunk_ids.setdefault(new_page, set()).add(global_chunk_id)
+                            chunk_pages.add(new_page)
+
+                        current_page = new_page
+                    except (IndexError, ValueError):
+                        continue
+
+                clean_chunk = re.sub(page_pattern, "", sub_chunk).strip()
+
+                if c["heading"] == "Introduction":
                     continue
 
-            # Clean sub_chunk by removing page markers
-            clean_chunk = re.sub(page_pattern, '', sub_chunk).strip()
-            
-            # Skip introduction chunks for embedding
-            if c["heading"] == "Introduction":
-                continue
-            
-            # Prepare metadata
-            meta = {
-                "filename": markdown_file,
-                "mode": chunk_config.to_string(),
-                "char_len": len(clean_chunk),
-                "word_len": len(clean_chunk.split()),
-                "section": c['heading'],
-                "section_path": full_section_path,
-                "text_preview": clean_chunk[:100],
-                "page_numbers": sorted(list(chunk_pages)),
-                "chunk_id": total_chunks + sub_chunk_id
-            }
+                meta = {
+                    "filename": markdown_file,
+                    "mode": chunk_config.to_string(),
+                    "char_len": len(clean_chunk),
+                    "word_len": len(clean_chunk.split()),
+                    "section": c["heading"],
+                    "section_path": full_section_path,
+                    "text_preview": clean_chunk[:100],
+                    "page_numbers": sorted(list(chunk_pages)),
+                    "chunk_id": global_chunk_id
+                }
 
-            # Prepare chunk with prefix
-            if use_headings:
-                chunk_prefix = (
-                    f"Description: {full_section_path} "
-                    f"Content: "
-                )
-            else:
-                chunk_prefix = ""
+                if use_headings:
+                    chunk_prefix = (
+                        f"Description: {full_section_path} "
+                        f"Content: "
+                    )
+                else:
+                    chunk_prefix = ""
 
-            all_chunks.append(chunk_prefix+clean_chunk)
-            sources.append(markdown_file)
-            metadata.append(meta)
+                all_chunks.append(chunk_prefix + clean_chunk)
+                sources.append(markdown_file)
+                metadata.append(meta)
 
-        total_chunks += len(sub_chunks)
+        doc_chunk_end = len(all_chunks) - 1
+        doc_ranges.append({
+            "path": markdown_file,
+            "chunk_start": doc_chunk_start,
+            "chunk_end": doc_chunk_end
+        })
 
-    # Convert the sets to sorted lists for a clean, predictable output
     final_map = {}
     for page, id_set in page_to_chunk_ids.items():
         final_map[page] = sorted(list(id_set))
@@ -236,6 +225,215 @@ def build_index(
     elapsed = time.perf_counter() - start_time
     print(f"Total indexing time: {elapsed:.2f} seconds")
 
+    return doc_ranges
+
+
+def update_index_add_only(
+    markdown_files: List[str],
+    *,
+    chunker: DocumentChunker,
+    chunk_config: ChunkConfig,
+    embedding_model_path: str,
+    artifacts_dir: os.PathLike,
+    index_prefix: str,
+    use_multiprocessing: bool = False,
+    use_headings: bool = False
+) -> List[Dict]:
+    """
+    Incrementally add new markdown documents to an existing index.
+
+    Loads existing artifacts, chunks only the new markdown files,
+    embeds only the new chunks, appends them to FAISS, rebuilds BM25
+    over old + new chunks, saves merged artifacts, and returns chunk
+    ranges for the newly added documents.
+    """
+    start_time = time.perf_counter()
+
+    if not markdown_files:
+        print("No new markdown files to add.")
+        return []
+
+    # Load existing artifacts
+    print("Loading existing index artifacts...")
+    faiss_idx = faiss.read_index(str(artifacts_dir / f"{index_prefix}.faiss"))
+
+    with open(artifacts_dir / f"{index_prefix}_chunks.pkl", "rb") as f:
+        old_chunks = pickle.load(f)
+
+    with open(artifacts_dir / f"{index_prefix}_sources.pkl", "rb") as f:
+        old_sources = pickle.load(f)
+
+    with open(artifacts_dir / f"{index_prefix}_meta.pkl", "rb") as f:
+        old_meta = pickle.load(f)
+
+    all_chunks: List[str] = list(old_chunks)
+    sources: List[str] = list(old_sources)
+    metadata: List[Dict] = list(old_meta)
+    doc_ranges: List[Dict] = []
+
+    # Rebuild page_to_chunk_map from existing metadata first
+    page_to_chunk_ids = {}
+    for meta in metadata:
+        chunk_id = meta["chunk_id"]
+        for page in meta.get("page_numbers", []):
+            page_to_chunk_ids.setdefault(page, set()).add(chunk_id)
+
+    # Estimate current page position from old metadata
+    max_existing_page = 1
+    for meta in metadata:
+        pages = meta.get("page_numbers", [])
+        if pages:
+            max_existing_page = max(max_existing_page, max(pages))
+    current_page = max_existing_page
+
+    page_pattern = re.compile(r"--- Page (\d+) ---")
+
+    for markdown_file in markdown_files:
+        print(f"Processing new markdown file: {markdown_file}")
+        sections = extract_sections_from_markdown(
+            markdown_file,
+            exclusion_keywords=DEFAULT_EXCLUSION_KEYWORDS
+        )
+
+        heading_stack = []
+        doc_chunk_start = len(all_chunks)
+
+        for c in sections:
+            current_level = c.get("level", 1)
+            chapter_num = c.get("chapter", 0)
+
+            while heading_stack and heading_stack[-1][0] >= current_level:
+                heading_stack.pop()
+
+            if c["heading"] != "Introduction":
+                heading_stack.append((current_level, c["heading"]))
+
+            path_list = [h[1] for h in heading_stack]
+            full_section_path = " ".join(path_list)
+            full_section_path = f"Chapter {chapter_num} " + full_section_path
+
+            sub_chunks = chunker.chunk(c["content"])
+
+            for sub_chunk in sub_chunks:
+                global_chunk_id = len(all_chunks)
+                chunk_pages = set()
+
+                fragments = page_pattern.split(sub_chunk)
+
+                if fragments[0].strip():
+                    page_to_chunk_ids.setdefault(current_page, set()).add(global_chunk_id)
+                    chunk_pages.add(current_page)
+
+                for i in range(1, len(fragments), 2):
+                    try:
+                        new_page = int(fragments[i]) + 1
+                        if fragments[i + 1].strip():
+                            page_to_chunk_ids.setdefault(new_page, set()).add(global_chunk_id)
+                            chunk_pages.add(new_page)
+                        current_page = new_page
+                    except (IndexError, ValueError):
+                        continue
+
+                clean_chunk = re.sub(page_pattern, "", sub_chunk).strip()
+
+                if c["heading"] == "Introduction":
+                    continue
+
+                meta = {
+                    "filename": markdown_file,
+                    "mode": chunk_config.to_string(),
+                    "char_len": len(clean_chunk),
+                    "word_len": len(clean_chunk.split()),
+                    "section": c["heading"],
+                    "section_path": full_section_path,
+                    "text_preview": clean_chunk[:100],
+                    "page_numbers": sorted(list(chunk_pages)),
+                    "chunk_id": global_chunk_id
+                }
+
+                if use_headings:
+                    chunk_prefix = (
+                        f"Description: {full_section_path} "
+                        f"Content: "
+                    )
+                else:
+                    chunk_prefix = ""
+
+                all_chunks.append(chunk_prefix + clean_chunk)
+                sources.append(markdown_file)
+                metadata.append(meta)
+
+        doc_chunk_end = len(all_chunks) - 1
+        doc_ranges.append({
+            "path": markdown_file,
+            "chunk_start": doc_chunk_start,
+            "chunk_end": doc_chunk_end
+        })
+
+    # If nothing new was added after filtering intro sections, stop here
+    if len(all_chunks) == len(old_chunks):
+        print("No new chunks were produced from the new markdown files.")
+        return []
+
+    new_chunks = all_chunks[len(old_chunks):]
+
+    # Save updated page_to_chunk_map
+    final_map = {page: sorted(list(ids)) for page, ids in page_to_chunk_ids.items()}
+    output_file = pathlib.Path(artifacts_dir) / f"{index_prefix}_page_to_chunk_map.json"
+    with open(output_file, "w") as f:
+        json.dump(final_map, f, indent=2)
+    print(f"Saved updated page to chunk ID map: {output_file}")
+
+    # Embed only the new chunks
+    print(f"Embedding {len(new_chunks):,} new chunks with {pathlib.Path(embedding_model_path).stem} ...")
+    embedder = SentenceTransformer(embedding_model_path)
+
+    if use_multiprocessing:
+        print("Starting multi-process pool for embeddings...")
+        pool = embedder.start_multi_process_pool(workers=4)
+        try:
+            new_embeddings = embedder.encode_multi_process(
+                new_chunks,
+                pool,
+                batch_size=32
+            )
+        finally:
+            embedder.stop_multi_process_pool(pool)
+    else:
+        new_embeddings = embedder.encode(
+            new_chunks,
+            batch_size=8,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+
+    # Append to existing FAISS index
+    print(f"Appending {len(new_chunks):,} new chunks to FAISS index...")
+    faiss_idx.add(new_embeddings)
+    faiss.write_index(faiss_idx, str(pathlib.Path(artifacts_dir) / f"{index_prefix}.faiss"))
+    print(f"Updated FAISS index saved: {index_prefix}.faiss")
+
+    # Rebuild BM25 over all chunks
+    print(f"Rebuilding BM25 over {len(all_chunks):,} total chunks...")
+    tokenized_chunks = [preprocess_for_bm25(chunk) for chunk in all_chunks]
+    bm25_index = BM25Okapi(tokenized_chunks)
+    with open(pathlib.Path(artifacts_dir) / f"{index_prefix}_bm25.pkl", "wb") as f:
+        pickle.dump(bm25_index, f)
+    print(f"Updated BM25 index saved: {index_prefix}_bm25.pkl")
+
+    # Save merged artifacts
+    with open(pathlib.Path(artifacts_dir) / f"{index_prefix}_chunks.pkl", "wb") as f:
+        pickle.dump(all_chunks, f)
+    with open(pathlib.Path(artifacts_dir) / f"{index_prefix}_sources.pkl", "wb") as f:
+        pickle.dump(sources, f)
+    with open(pathlib.Path(artifacts_dir) / f"{index_prefix}_meta.pkl", "wb") as f:
+        pickle.dump(metadata, f)
+    print(f"Saved updated index artifacts with prefix: {index_prefix}")
+
+    elapsed = time.perf_counter() - start_time
+    print(f"Incremental add-only indexing time: {elapsed:.2f} seconds")
+
+    return doc_ranges
 # ------------------------ Helper functions ------------------------------
 
 def preprocess_for_bm25(text: str) -> list[str]:
